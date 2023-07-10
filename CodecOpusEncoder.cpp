@@ -101,6 +101,7 @@
 
 #include <cstdlib>  // std::malloc, std::free
 #include <nn/nn_Abort.h>
+#include <nn/nn_Assert.h>
 #include <nn/audio.h>
 #include <nn/codec.h>
 #include <nn/fs.h>
@@ -116,11 +117,76 @@
 //==============================================================================
 
 #include "SwitchVoiceChatNativeCode.h"
-//#include "SwitchVoiceChatDecodeNativeCode.h"
+#include "SwitchVoiceChatDecodeNativeCode.h"
 
 namespace {
+    const int MaxAudioIns = 2;
 
-char g_HeapBuffer[8 * 1024 * 1024];
+    char g_HeapBuffer[128 * 1024 * 16];
+    const size_t ThreadStackSize = 8192 * 2;
+    NN_ALIGNAS(4096) char g_AudioOutThreadStack[ThreadStackSize];
+    nn::os::ThreadType    g_AudioOutThread;
+    NN_ALIGNAS(4096) char g_AudioInThreadStack[ThreadStackSize];
+    nn::os::ThreadType    g_AudioInThread;
+    struct AudioOutArgs
+    {
+        nn::os::SystemEvent* event;
+        nn::audio::AudioOut* audioOut;
+        std::atomic<bool> isRunning;
+    };
+    AudioOutArgs g_OutArgs;
+
+    void AudioOutThread(void* arg)
+    {
+        AudioOutArgs* args = reinterpret_cast<AudioOutArgs*>(arg);
+        nn::audio::AudioOut* audioOutPointer = args->audioOut;
+        intptr_t* handler = new intptr_t;
+        char* something = new char;
+        char** bufferOut = &something;
+        int* count = new int();
+        float* something2 = new float;
+        float** bufferPtr = &something2;
+        int* sampleCount;
+        unsigned int* sampleRateOut = new unsigned int;
+        while (args->isRunning)
+        {
+            // Get the buffer that completed recording.
+            args->event->Wait();
+
+            if (!args->isRunning)
+            {
+                break;
+            }
+
+            nn::audio::AudioOutBuffer* pAudioOutBuffer = nullptr;
+
+            pAudioOutBuffer = nn::audio::GetReleasedAudioOutBuffer(audioOutPointer);
+
+            int bufferCount = 0;
+            while (pAudioOutBuffer)
+            {
+                ++bufferCount;
+                // Copy data and register again.
+                void* pOutBuffer = nn::audio::GetAudioOutBufferDataPointer(pAudioOutBuffer);
+                char* pOutBufferChar = reinterpret_cast<char*>(pOutBuffer);
+                size_t outSize = nn::audio::GetAudioOutBufferDataSize(pAudioOutBuffer);
+
+                memset(pOutBuffer, 0, outSize);
+                if (SwitchVoiceChatNativeCode::wntgd_GetVoiceBuffer(handler, bufferOut, count))
+                {
+                    int count2;
+                    if (SwitchVoiceChatDecodeNativeCode::wntgd_DecompressVoiceData(handler, pOutBufferChar, *count, bufferPtr, count, sampleRateOut))
+                    {
+                        NN_LOG("AAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+                    }
+                }
+                nn::audio::AppendAudioOutBuffer(audioOutPointer, pAudioOutBuffer);
+                pAudioOutBuffer = nn::audio::GetReleasedAudioOutBuffer(audioOutPointer);
+            }
+        }
+    }
+
+//char g_HeapBuffer[8 * 1024 * 1024];
 
 char* g_MountRomCacheBuffer = nullptr;
 
@@ -181,9 +247,143 @@ extern "C" void nnMain()
     nns::audio::WavFormat wavFormat;
     auto parseResult = ParseWavFormat(&wavFormat, pWaveDataHead, static_cast<size_t>(size));
     NN_ABORT_UNLESS(parseResult == nns::audio::WavResult_Success);
-    const int channelCount = wavFormat.channelCount;
+    const int wavChannelCount = wavFormat.channelCount;
     const int encoderSampleRate = wavFormat.sampleRate;
-    const int64_t sampleCountPerChannel = wavFormat.dataSize / (wavFormat.bitsPerSample >> 3) / channelCount;
+    const int64_t sampleCountPerChannel = wavFormat.dataSize / (wavFormat.bitsPerSample >> 3) / wavChannelCount;
+
+    intptr_t* handler = new intptr_t;
+    char* something = new char;
+    char** bufferOut = &something;
+    int* count = new int();
+    float* something2 = new float;
+    float** bufferPtr = &something2;
+    int* sampleCount;
+    unsigned int* sampleRateOut = new unsigned int;
+
+    //Custom code
+    SwitchVoiceChatNativeCode::wntgd_StartRecordVoice();
+    SwitchVoiceChatDecodeNativeCode::wntgd_InitializeDecoder();
+
+    nn::audio::AudioOutParameter audioOutParameter;
+    audioOutParameter.channelCount = 1;
+    nn::audio::AudioOut audioOut;
+
+    auto argc = nn::os::GetHostArgc();
+    auto argv = nn::os::GetHostArgv();
+    int bufferLengthInMilliseconds = 50;
+    if (argc >= 2)
+    {
+        bufferLengthInMilliseconds = atoi(argv[1]);
+    }
+    if (bufferLengthInMilliseconds > 50 || bufferLengthInMilliseconds < 0)
+    {
+        NNS_LOG("Clamping bufferLengthInMilliseconds from %d to 50\n", bufferLengthInMilliseconds);
+        bufferLengthInMilliseconds = 50;
+    }
+    nn::os::SystemEvent audioOutSystemEvent;
+    // Open audio input and audio output.
+
+    nn::audio::InitializeAudioOutParameter(&audioOutParameter);
+    NN_ABORT_UNLESS(
+        nn::audio::OpenDefaultAudioOut(&audioOut, &audioOutSystemEvent, audioOutParameter).IsSuccess(),
+        "Failed to open AudioOut."
+    );
+
+    int channelCount = nn::audio::GetAudioOutChannelCount(&audioOut);
+    int sampleRate = nn::audio::GetAudioOutSampleRate(&audioOut);
+    nn::audio::SampleFormat sampleFormat = nn::audio::GetAudioOutSampleFormat(&audioOut);
+    // Prepare parameters for the buffer.
+    NNS_LOG("bufferLengthInMilliseconds = %d\n", bufferLengthInMilliseconds);
+    int millisecondsPerSecond = 1000;
+    int frameRate = millisecondsPerSecond / bufferLengthInMilliseconds;
+    int frameSampleCount = sampleRate / frameRate;
+    size_t dataSize = frameSampleCount * channelCount * nn::audio::GetSampleByteSize(sampleFormat);
+    size_t bufferSize = nn::util::align_up(dataSize, nn::audio::AudioOutBuffer::SizeGranularity);
+
+    const int outBufferCount = 3;
+
+    // Allocate and add a buffer.
+    nn::audio::AudioOutBuffer audioOutBuffer[outBufferCount];
+    void* outBuffer[outBufferCount];
+
+    for (int i = 0; i < outBufferCount; ++i)
+    {
+        outBuffer[i] = allocator.Allocate(bufferSize, nn::audio::AudioOutBuffer::AddressAlignment);
+        NN_ASSERT(outBuffer[i]);
+        std::memset(outBuffer[i], 0, bufferSize);
+        nn::audio::SetAudioOutBufferInfo(&audioOutBuffer[i], outBuffer[i], bufferSize, dataSize);
+        nn::audio::AppendAudioOutBuffer(&audioOut, &audioOutBuffer[i]);
+    }
+    // Start recording and playback.
+    NN_ABORT_UNLESS(
+        nn::audio::StartAudioOut(&audioOut).IsSuccess(),
+        "Failed to start AudioOut."
+    );
+
+    // Wait one frame.
+    const nn::TimeSpan interval(nn::TimeSpan::FromNanoSeconds(1000 * 1000 * 1000 / frameRate));
+    nn::os::SleepThread(interval);
+
+    // Perform echo back for 15 seconds.
+
+    g_OutArgs.event = &audioOutSystemEvent;
+    g_OutArgs.audioOut = &audioOut;
+    g_OutArgs.isRunning = true;
+
+    nn::os::CreateThread(&g_AudioOutThread, AudioOutThread, &g_OutArgs, g_AudioOutThreadStack,
+        ThreadStackSize, nn::os::HighestThreadPriority);
+
+    nn::os::StartThread(&g_AudioOutThread);
+
+    nn::audio::AudioOut* audioOutPointer = &audioOut;
+    for(;;)
+    {
+        //// Get the buffer that completed recording.
+        ////args->event->Wait();
+
+        ///*if (!args->isRunning)
+        //{
+        //    break;
+        //}*/
+
+        //nn::audio::AudioOutBuffer* pAudioOutBuffer = nullptr;
+
+        //pAudioOutBuffer = nn::audio::GetReleasedAudioOutBuffer(audioOutPointer);
+
+        //int bufferCount = 0;
+        //while (pAudioOutBuffer)
+        //{
+        //    ++bufferCount;
+        //    // Copy data and register again.
+        //    void* pOutBuffer = nn::audio::GetAudioOutBufferDataPointer(pAudioOutBuffer);
+        //    char* pOutBufferChar = reinterpret_cast<char*>(pOutBuffer);
+        //    size_t outSize = nn::audio::GetAudioOutBufferDataSize(pAudioOutBuffer);
+
+        //    memset(pOutBuffer, 0, outSize);
+        //    if (SwitchVoiceChatNativeCode::wntgd_GetVoiceBuffer(handler, bufferOut, count))
+        //    {
+        //        int count2;
+        //        if (SwitchVoiceChatDecodeNativeCode::wntgd_DecompressVoiceData(handler, pOutBufferChar, *count, bufferPtr, count, sampleRateOut))
+        //        {
+        //            NN_LOG("AAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        //        }
+        //    }
+        //    nn::audio::AppendAudioOutBuffer(audioOutPointer, pAudioOutBuffer);
+        //    pAudioOutBuffer = nn::audio::GetReleasedAudioOutBuffer(audioOutPointer);
+        //}
+    }
+
+    for (;;)
+    {
+        if (SwitchVoiceChatNativeCode::wntgd_GetVoiceBuffer(handler, bufferOut, count))
+        {
+            int count2;
+            if (SwitchVoiceChatDecodeNativeCode::wntgd_DecompressVoiceData(handler, *bufferOut, *count, bufferPtr, count, sampleRateOut))
+            {
+
+            }
+        }
+    }
 
     // Initialize the Opus encoder.
     nn::codec::OpusEncoder encoder;
